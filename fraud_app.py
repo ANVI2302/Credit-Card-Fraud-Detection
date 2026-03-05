@@ -311,16 +311,82 @@ def preprocess_single(amount, hour, merchant, foreign, location, device, velocit
 
 
 def preprocess_batch(df_raw):
-    """Encode and scale a batch CSV. Returns processed df and original."""
+    """
+    Encode and scale a batch CSV for model inference.
+
+    merchant_category encoding strategy (in priority order):
+      1. Saved LabelEncoder (label_encoder.pkl) — used if artifact is loaded.
+         Raises a clear ValueError if the CSV contains unknown category strings.
+      2. pd.get_dummies fallback — used when the encoder artifact is absent.
+         Dummy columns are aligned to the exact columns seen during training so
+         the feature matrix always matches what the model expects.
+
+    Raises ValueError with a human-readable message on bad input so the
+    Streamlit error handler can display it cleanly instead of a raw traceback.
+    """
     df = df_raw.copy()
-    # Drop non-feature columns if present
+
+    # ── Drop identifier / target columns if present ──────────────────────────
     for col in ["transaction_id", "is_fraud"]:
         if col in df.columns:
             df = df.drop(columns=[col])
+
+    # ── Validate merchant_category column exists ──────────────────────────────
+    if "merchant_category" not in df.columns:
+        raise ValueError(
+            "CSV is missing the 'merchant_category' column. "
+            f"Columns detected: {df.columns.tolist()}"
+        )
+
+    # ── Encode merchant_category ──────────────────────────────────────────────
     if "encoder" in artifacts:
-        df["merchant_category"] = artifacts["encoder"].transform(df["merchant_category"])
-    df[["amount"]] = artifacts["scaler"].transform(df[["amount"]])
-    return df[FEATURE_COLS]
+        # Primary path: use the saved LabelEncoder from training.
+        # This maps "Electronics" → 1, "Travel" → 4, etc. exactly as during
+        # training. Unknown strings get a clear error rather than a silent crash.
+        le = artifacts["encoder"]
+        known_cats = set(le.classes_)
+        found_cats = set(df["merchant_category"].dropna().unique())
+        unknown    = found_cats - known_cats
+
+        if unknown:
+            raise ValueError(
+                f"merchant_category contains unrecognised values: {sorted(unknown)}.\n"
+                f"Accepted values are: {sorted(known_cats)}"
+            )
+
+        df["merchant_category"] = le.transform(df["merchant_category"])
+        df[["amount"]] = artifacts["scaler"].transform(df[["amount"]])
+        return df[FEATURE_COLS]
+
+    else:
+        # Fallback path: label_encoder.pkl not found, so use pd.get_dummies.
+        # We one-hot encode merchant_category and align columns to the fixed
+        # training schema so the model always receives the right feature count.
+        st.warning(
+            "⚠️ label_encoder.pkl not found — using pd.get_dummies() fallback. "
+            "Place label_encoder.pkl alongside the app for exact encoding.",
+            icon="⚠️",
+        )
+        dummies = pd.get_dummies(df["merchant_category"], prefix="merchant_category")
+        df = df.drop(columns=["merchant_category"])
+
+        # Ensure every category column the model expects is present,
+        # even if that category doesn't appear in this particular batch.
+        expected_dummies = [f"merchant_category_{c}" for c in MERCHANT_CATS]
+        for col in expected_dummies:
+            if col not in dummies.columns:
+                dummies[col] = 0
+        dummies = dummies[expected_dummies]  # enforce column order
+
+        df = pd.concat([df.reset_index(drop=True),
+                        dummies.reset_index(drop=True)], axis=1)
+
+        # Build the feature column list replacing the single int column
+        # with the one-hot columns so the model gets the right shape.
+        fallback_cols = [c for c in FEATURE_COLS if c != "merchant_category"] \
+                        + expected_dummies
+        df[["amount"]] = artifacts["scaler"].transform(df[["amount"]])
+        return df[fallback_cols]
 
 
 def predict(X):
