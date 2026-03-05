@@ -398,8 +398,12 @@ with tab_batch:
 
                 def highlight_fraud(row):
                     if row["Prediction"] == "FRAUD":
-                        return ["background-color: rgba(239,68,68,0.10); color: #fca5a5" if c == "Prediction" else "background-color: rgba(239,68,68,0.06); color: #e2e8f0" for c in row.index]
-                    return ["color: #86efac" if c == "Prediction" else "color: #e2e8f0" for c in row.index]
+                        return ["background-color: rgba(239,68,68,0.10); color: #fca5a5"
+                            if c == "Prediction" else
+                            "background-color: rgba(239,68,68,0.06); color: #e2e8f0"
+                            for c in row.index]
+                    return ["color: #86efac" if c == "Prediction" else "color: #e2e8f0"
+                            for c in row.index]
 
                 styled = (
                     df_display.style.apply(highlight_fraud, axis=1)
