@@ -7,3 +7,4 @@ xgboost
 imbalanced-learn
 matplotlib
 seaborn
+reportlab
