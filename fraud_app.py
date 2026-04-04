@@ -674,55 +674,31 @@ with tab_single:
     with col_result:
         st.markdown("<div class='section-label'>Analysis Result</div>", unsafe_allow_html=True)
         if analyze_btn:
-    with st.spinner("Running inference..."):
-        X = preprocess_single(amount, hour, merchant, foreign,
-                              location, device, velocity, age)
-        prob, pred_label = predict(X)
-        prob_val = float(prob[0])
-        is_fraud = bool(pred_label[0])
+            with st.spinner("Running inference..."):
+                X = preprocess_single(amount, hour, merchant, foreign,
+                                      location, device, velocity, age)
+                prob, pred_label = predict(X)
+                prob_val = float(prob[0])
+                is_fraud = bool(pred_label[0])
 
-    verdict = "FRAUD" if is_fraud else "LEGITIMATE"
+            verdict = "FRAUD" if is_fraud else "LEGITIMATE"
 
-    # ── Verdict UI
-    if is_fraud:
-        st.markdown(f"""
-        <div class='verdict-fraud'>
-            <div class='verdict-title'>🚨 FRAUDULENT</div>
-            <div class='verdict-conf'>Confidence: {prob_val*100:.1f}% fraud probability</div>
-        </div>""", unsafe_allow_html=True)
-    else:
-        st.markdown(f"""
-        <div class='verdict-legit'>
-            <div class='verdict-title'>✅ LEGITIMATE</div>
-            <div class='verdict-conf'>Confidence: {(1-prob_val)*100:.1f}% legitimate probability</div>
-        </div>""", unsafe_allow_html=True)
+            if is_fraud:
+                st.markdown(f"""
+                <div class='verdict-fraud'>
+                    <div class='verdict-title'>🚨 FRAUDULENT</div>
+                    <div class='verdict-conf'>Confidence: {prob_val*100:.1f}% fraud probability</div>
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class='verdict-legit'>
+                    <div class='verdict-title'>✅ LEGITIMATE</div>
+                    <div class='verdict-conf'>Confidence: {(1-prob_val)*100:.1f}% legitimate probability</div>
+                </div>""", unsafe_allow_html=True)
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Gauge Chart
-    st.plotly_chart(
-        gauge_chart(prob_val, is_fraud),
-        use_container_width=True,
-        config={"displayModeBar": False}
-    )
-
-    # ── Explainability Section (FIXED + CORRECT POSITION)
-    st.markdown("<div class='section-label'>Why this prediction?</div>", unsafe_allow_html=True)
-
-    try:
-        importances = artifacts["model"].feature_importances_
-        features = FEATURE_COLS
-
-        importance_df = pd.DataFrame({
-            "Feature": features,
-            "Importance": importances
-        }).sort_values(by="Importance", ascending=False)
-
-        st.bar_chart(importance_df.set_index("Feature"))
-
-    except AttributeError:
-        st.warning("⚠️ Feature importance not available for this model.")
-
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.plotly_chart(gauge_chart(prob_val, is_fraud),
+                            use_container_width=True, config={"displayModeBar": False})
 
             # ── PDF Export button
             st.markdown("<div class='section-label' style='margin-top:0.5rem;'>Export</div>",
