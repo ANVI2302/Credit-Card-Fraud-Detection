@@ -3,9 +3,9 @@ import pandas as pd
 import numpy as np
 import pickle
 import plotly.graph_objects as go
-import plotly.express as px
 from pathlib import Path
 import io
+import datetime
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -49,6 +49,7 @@ st.markdown("""
     .stat-row { display: flex; justify-content: space-between; align-items: center; padding: 0.6rem 0; border-bottom: 1px solid #1a2030; }
     .stat-name { font-size: 0.78rem; color: #64748b; font-family: 'Space Mono', monospace; }
     .stat-val { font-size: 0.9rem; font-weight: 600; font-family: 'Space Mono', monospace; color: #22c55e; }
+    .warning-box { background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.3); border-left: 4px solid #f59e0b; border-radius: 8px; padding: 0.75rem 1rem; font-family: 'Space Mono', monospace; font-size: 0.75rem; color: #fbbf24; margin-bottom: 1rem; }
     hr { border-color: #1e2533 !important; }
     .fraud-row { background-color: rgba(239,68,68,0.08) !important; }
     .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; display: inline-block; margin-right: 6px; animation: pulse 2s infinite; }
@@ -56,6 +57,7 @@ st.markdown("""
     [data-testid="stFileUploader"] { border: 1px dashed #1e2533 !important; border-radius: 12px !important; background: #0d1117 !important; }
     #MainMenu, footer, header { visibility: hidden; }
     .block-container { padding-top: 2rem; max-width: 1400px; }
+    .metric-tooltip { font-size: 0.68rem; color: #475569; font-family: 'DM Sans', sans-serif; margin-top: 0.2rem; font-style: italic; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -63,14 +65,9 @@ st.markdown("""
 # ─── Load Model Artifacts ─────────────────────────────────────────────────────
 @st.cache_resource
 def load_artifacts():
-    """Load model, scaler, and label encoder. Searches common locations."""
     search_dirs = [Path("."), Path("/home/claude"), Path("/mnt/user-data/uploads")]
     artifacts = {}
-    files = {
-        "model":   "fraud_model.pkl",
-        "scaler":  "scaler.pkl",
-        "encoder": "label_encoder.pkl",
-    }
+    files = {"model": "fraud_model.pkl", "scaler": "scaler.pkl", "encoder": "label_encoder.pkl"}
     for key, fname in files.items():
         for d in search_dirs:
             p = d / fname
@@ -89,117 +86,233 @@ FEATURE_COLS  = ["amount", "transaction_hour", "merchant_category",
                  "foreign_transaction", "location_mismatch",
                  "device_trust_score", "velocity_last_24h", "cardholder_age"]
 MERCHANT_CATS = ["Clothing", "Electronics", "Food", "Grocery", "Travel"]
-
-# Hardcoded label-encoding map — mirrors exactly what LabelEncoder produces
-# (alphabetical order: Clothing=0, Electronics=1, Food=2, Grocery=3, Travel=4).
-# Used only when label_encoder.pkl cannot be found.
 MERCHANT_LABEL_MAP = {cat: i for i, cat in enumerate(sorted(MERCHANT_CATS))}
 
 MODEL_STATS = {
-    "Precision": 1.00,
-    "Recall":    0.60,
-    "F1-Score":  0.75,
-    "ROC-AUC":   1.00,
+    "Precision": (1.00, "Of all flagged frauds, how many were actually fraud"),
+    "Recall":    (0.60, "Of all real frauds, how many did the model catch"),
+    "F1-Score":  (0.75, "Harmonic mean of precision and recall"),
+    "ROC-AUC":   (1.00, "Overall ability to distinguish fraud from legitimate"),
+}
+
+# ─── Column name aliases for flexible CSV ingestion ───────────────────────────
+# Maps common variations → canonical FEATURE_COLS name
+COLUMN_ALIASES = {
+    # amount
+    "transaction_amount": "amount", "trans_amount": "amount",
+    "amt": "amount", "price": "amount", "value": "amount",
+    # transaction_hour
+    "hour": "transaction_hour", "txn_hour": "transaction_hour",
+    "trans_hour": "transaction_hour", "time_hour": "transaction_hour",
+    # merchant_category
+    "merchant": "merchant_category", "category": "merchant_category",
+    "merchant_cat": "merchant_category", "merchant_type": "merchant_category",
+    "mcc_category": "merchant_category",
+    # foreign_transaction
+    "foreign": "foreign_transaction", "is_foreign": "foreign_transaction",
+    "international": "foreign_transaction", "foreign_txn": "foreign_transaction",
+    # location_mismatch
+    "location": "location_mismatch", "loc_mismatch": "location_mismatch",
+    "geo_mismatch": "location_mismatch", "location_flag": "location_mismatch",
+    # device_trust_score
+    "device_score": "device_trust_score", "trust_score": "device_trust_score",
+    "device": "device_trust_score", "device_trust": "device_trust_score",
+    # velocity_last_24h
+    "velocity": "velocity_last_24h", "txn_velocity": "velocity_last_24h",
+    "transactions_24h": "velocity_last_24h", "velocity_24h": "velocity_last_24h",
+    "num_transactions": "velocity_last_24h",
+    # cardholder_age
+    "age": "cardholder_age", "customer_age": "cardholder_age",
+    "holder_age": "cardholder_age", "user_age": "cardholder_age",
+}
+
+# Canonical merchant name aliases for flexible category matching
+MERCHANT_ALIASES = {
+    "cloth": "Clothing", "clothes": "Clothing", "apparel": "Clothing", "fashion": "Clothing",
+    "elec": "Electronics", "electronic": "Electronics", "tech": "Electronics",
+    "food": "Food", "restaurant": "Food", "dining": "Food", "eat": "Food",
+    "grocer": "Grocery", "supermarket": "Grocery", "mart": "Grocery",
+    "travel": "Travel", "hotel": "Travel", "airline": "Travel", "flight": "Travel",
 }
 
 
 # ─── Helper Functions ─────────────────────────────────────────────────────────
-def encode_merchant(series):
-    """
-    Encode merchant_category strings to integer codes.
 
-    Priority:
-      1. Saved LabelEncoder from label_encoder.pkl  — exact match to training.
-      2. Hardcoded alphabetical map                 — safe fallback, same result
-         because sklearn LabelEncoder sorts classes alphabetically.
-
-    Raises ValueError with a clear message if any value is not recognised,
-    so the Streamlit error block shows a human-readable explanation rather
-    than a cryptic numpy traceback.
+def normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """
-    # Validate values before encoding regardless of which path we take
+    Normalise DataFrame column names:
+      1. Strip whitespace, lowercase.
+      2. Apply COLUMN_ALIASES to map known variants → canonical names.
+    Returns (renamed_df, list_of_warnings).
+    """
+    warnings = []
+    rename_map = {}
+    for col in df.columns:
+        clean = col.strip().lower().replace(" ", "_").replace("-", "_")
+        if clean in COLUMN_ALIASES:
+            canonical = COLUMN_ALIASES[clean]
+            rename_map[col] = canonical
+            if col != canonical:
+                warnings.append(f"Renamed column '{col}' → '{canonical}'")
+        elif clean != col:
+            rename_map[col] = clean
+    return df.rename(columns=rename_map), warnings
+
+
+def normalize_merchant(series: pd.Series) -> pd.Series:
+    """
+    Attempt to map free-text merchant category values to known canonical values.
+    Exact match (case-insensitive) first; then partial alias match.
+    Returns the normalised series.
+    """
+    known_lower = {c.lower(): c for c in MERCHANT_CATS}
+
+    def map_val(v):
+        if pd.isna(v):
+            return v
+        v_str = str(v).strip()
+        # Exact case-insensitive match
+        if v_str.lower() in known_lower:
+            return known_lower[v_str.lower()]
+        # Alias partial match
+        for alias, canonical in MERCHANT_ALIASES.items():
+            if alias in v_str.lower():
+                return canonical
+        return v_str  # unchanged — will fail validation later with a clear message
+
+    return series.map(map_val)
+
+
+def validate_dataframe(df: pd.DataFrame) -> list[str]:
+    """
+    Validate feature values. Returns list of human-readable error strings.
+    Checks: numeric types, value ranges, null counts, merchant categories.
+    """
+    errors = []
+
+    # Nulls
+    null_counts = df[FEATURE_COLS].isnull().sum()
+    for col, cnt in null_counts.items():
+        if cnt > 0:
+            errors.append(f"'{col}' has {cnt} null value(s) — rows with nulls will be dropped")
+
+    # Merchant categories
+    if "merchant_category" in df.columns:
+        unknown = set(df["merchant_category"].dropna().unique()) - set(MERCHANT_CATS)
+        if unknown:
+            errors.append(
+                f"Unknown merchant_category values: {sorted(unknown)}. "
+                f"Accepted: {sorted(MERCHANT_CATS)}"
+            )
+
+    # Numeric range checks
+    range_checks = {
+        "amount":             (0, 1_000_000),
+        "transaction_hour":   (0, 23),
+        "foreign_transaction":(0, 1),
+        "location_mismatch":  (0, 1),
+        "device_trust_score": (0, 100),
+        "velocity_last_24h":  (0, 1000),
+        "cardholder_age":     (0, 130),
+    }
+    for col, (lo, hi) in range_checks.items():
+        if col in df.columns:
+            try:
+                numeric = pd.to_numeric(df[col], errors="coerce")
+                out = numeric[(numeric < lo) | (numeric > hi)].dropna()
+                if len(out):
+                    errors.append(f"'{col}' has {len(out)} out-of-range value(s) (expected {lo}–{hi})")
+            except Exception:
+                pass
+    return errors
+
+
+def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce columns to numeric where possible; keep merchant_category as string."""
+    for col in FEATURE_COLS:
+        if col == "merchant_category":
+            df[col] = df[col].astype(str).str.strip()
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def encode_merchant(series: pd.Series) -> pd.Series:
     known = set(MERCHANT_CATS)
-    found = set(series.dropna().unique())
-    unknown = found - known
+    unknown = set(series.dropna().unique()) - known
     if unknown:
         raise ValueError(
             f"merchant_category contains unrecognised values: {sorted(unknown)}.\n"
             f"Accepted values are: {sorted(known)}"
         )
-
     if "encoder" in artifacts:
-        # Primary path: use the fitted LabelEncoder saved during training
         return artifacts["encoder"].transform(series)
-    else:
-        # Fallback: alphabetical integer map — identical output to LabelEncoder
-        return series.map(MERCHANT_LABEL_MAP)
+    return series.map(MERCHANT_LABEL_MAP)
 
 
 def preprocess_single(amount, hour, merchant, foreign, location, device, velocity, age):
-    """
-    Build and preprocess a single-transaction DataFrame for inference.
-    merchant_category is encoded to an integer; amount is scaled.
-    Returns a DataFrame with exactly FEATURE_COLS columns.
-    """
     df = pd.DataFrame([{
-        "amount":              amount,
-        "transaction_hour":    hour,
-        "merchant_category":   merchant,
-        "foreign_transaction": foreign,
-        "location_mismatch":   location,
-        "device_trust_score":  device,
-        "velocity_last_24h":   velocity,
-        "cardholder_age":      age,
+        "amount": amount, "transaction_hour": hour, "merchant_category": merchant,
+        "foreign_transaction": foreign, "location_mismatch": location,
+        "device_trust_score": device, "velocity_last_24h": velocity, "cardholder_age": age,
     }])
     df["merchant_category"] = encode_merchant(df["merchant_category"])
     df[["amount"]] = artifacts["scaler"].transform(df[["amount"]])
     return df[FEATURE_COLS]
 
 
-def preprocess_batch(df_raw):
+def preprocess_batch(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, list[str], pd.DataFrame]:
     """
-    Preprocess an uploaded CSV for batch inference.
-
-    Steps:
-      1. Drop non-feature columns (transaction_id, is_fraud) if present.
-      2. Validate merchant_category column exists.
-      3. Encode merchant_category as a single integer column via encode_merchant()
-         — this always produces exactly 1 column, keeping the feature count at 8.
-         Using pd.get_dummies() here would expand to 5+ columns and break the model.
-      4. Scale amount with the fitted StandardScaler.
-      5. Return df with exactly FEATURE_COLS in the correct order.
-
-    Raises ValueError with readable messages for missing/invalid columns
-    so the Streamlit except block can surface them cleanly.
+    Flexible preprocessing for any transaction CSV.
+    Returns (X_features, warnings_list, clean_df_for_display).
+    Raises ValueError with clear message on unrecoverable issues.
     """
-    df = df_raw.copy()
+    df, col_warnings = normalize_columns(df_raw.copy())
+    warnings = col_warnings[:]
 
-    # ── 1. Drop identifier / target columns ──────────────────────────────────
-    for col in ["transaction_id", "is_fraud"]:
+    # Drop identifier / target columns
+    for col in ["transaction_id", "is_fraud", "id", "txn_id", "index"]:
         if col in df.columns:
             df = df.drop(columns=[col])
 
-    # ── 2. Validate required columns are all present ──────────────────────────
-    missing_cols = [c for c in FEATURE_COLS if c not in df.columns]
-    if missing_cols:
+    # Check required columns
+    missing = [c for c in FEATURE_COLS if c not in df.columns]
+    if missing:
         raise ValueError(
-            f"CSV is missing required column(s): {missing_cols}\n"
-            f"Columns detected in file: {df.columns.tolist()}"
+            f"Missing required column(s): {missing}\n"
+            f"Columns in file: {df.columns.tolist()}\n"
+            f"Tip: Column names are normalised automatically. "
+            f"Check the accepted aliases or rename columns to match the template."
         )
 
-    # ── 3. Encode merchant_category → single integer column ───────────────────
-    # IMPORTANT: must stay as one column (integer), NOT one-hot encoded.
-    # The model was trained with LabelEncoder which maps each category to a
-    # single integer. Using pd.get_dummies() would produce 5 columns instead
-    # of 1, increasing the total feature count from 8 to 12 and causing:
-    #   ValueError: X has 12 features, but model is expecting 8 features.
-    df["merchant_category"] = encode_merchant(df["merchant_category"])
+    # Normalise merchant category text
+    df["merchant_category"] = normalize_merchant(df["merchant_category"])
 
-    # ── 4. Scale amount ───────────────────────────────────────────────────────
+    # Coerce types
+    df = coerce_types(df)
+
+    # Validate — collect warnings (non-fatal) vs errors (fatal)
+    validation_issues = validate_dataframe(df)
+    for issue in validation_issues:
+        warnings.append(f"⚠ {issue}")
+
+    # Drop null rows (after warning)
+    before = len(df)
+    df = df.dropna(subset=FEATURE_COLS)
+    dropped = before - len(df)
+    if dropped:
+        warnings.append(f"Dropped {dropped} row(s) with null values in required columns")
+
+    if len(df) == 0:
+        raise ValueError("No valid rows remain after cleaning. Check your CSV data.")
+
+    clean_df = df.copy()
+
+    # Encode + scale
+    df["merchant_category"] = encode_merchant(df["merchant_category"])
     df[["amount"]] = artifacts["scaler"].transform(df[["amount"]])
 
-    # ── 5. Return exactly the 8 features the model expects, in training order ─
-    return df[FEATURE_COLS]
+    return df[FEATURE_COLS], warnings, clean_df
 
 
 def predict(X):
@@ -208,6 +321,156 @@ def predict(X):
     return prob, label
 
 
+# ─── PDF Report Generator ─────────────────────────────────────────────────────
+def generate_pdf_report(
+    verdict: str,
+    prob_val: float,
+    amount: float,
+    hour: int,
+    merchant: str,
+    foreign: int,
+    location: int,
+    device: int,
+    velocity: int,
+    age: int,
+) -> bytes:
+    """Generate a styled single-transaction PDF report using reportlab."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        leftMargin=20*mm, rightMargin=20*mm,
+        topMargin=18*mm, bottomMargin=18*mm,
+    )
+
+    # ── Colour palette
+    BG_DARK   = colors.HexColor("#0a0d14")
+    CARD_BG   = colors.HexColor("#111827")
+    ACCENT    = colors.HexColor("#ef4444")
+    ORANGE    = colors.HexColor("#f97316")
+    GREEN     = colors.HexColor("#22c55e")
+    MUTED     = colors.HexColor("#64748b")
+    BORDER    = colors.HexColor("#1e2533")
+    TEXT_MAIN = colors.HexColor("#e2e8f0")
+    TEXT_DIM  = colors.HexColor("#94a3b8")
+
+    verdict_color = ACCENT if verdict == "FRAUD" else GREEN
+
+    # ── Styles
+    def sty(name, **kw):
+        return ParagraphStyle(name, **kw)
+
+    s_title   = sty("title",   fontSize=22, textColor=ACCENT,    fontName="Helvetica-Bold",
+                    alignment=TA_CENTER, spaceAfter=2)
+    s_sub     = sty("sub",     fontSize=8,  textColor=MUTED,     fontName="Helvetica",
+                    alignment=TA_CENTER, spaceAfter=14, leading=12)
+    s_verdict = sty("verdict", fontSize=18, textColor=verdict_color, fontName="Helvetica-Bold",
+                    alignment=TA_CENTER, spaceAfter=4)
+    s_conf    = sty("conf",    fontSize=9,  textColor=TEXT_DIM,  fontName="Helvetica",
+                    alignment=TA_CENTER, spaceAfter=16)
+    s_section = sty("section", fontSize=7,  textColor=MUTED,     fontName="Helvetica-Bold",
+                    spaceAfter=6, spaceBefore=14, leading=10)
+    s_label   = sty("label",   fontSize=8,  textColor=TEXT_DIM,  fontName="Helvetica")
+    s_value   = sty("value",   fontSize=9,  textColor=TEXT_MAIN, fontName="Helvetica-Bold")
+    s_footer  = sty("footer",  fontSize=7,  textColor=MUTED,     fontName="Helvetica",
+                    alignment=TA_CENTER)
+
+    story = []
+
+    # ── Header
+    story.append(Paragraph("🛡 FRAUDGUARD AI", s_title))
+    ts = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S UTC")
+    story.append(Paragraph(f"TRANSACTION ANALYSIS REPORT  ·  {ts}", s_sub))
+    story.append(HRFlowable(width="100%", thickness=1, color=BORDER, spaceAfter=12))
+
+    # ── Verdict banner
+    verdict_label = "🚨  FRAUDULENT TRANSACTION" if verdict == "FRAUD" else "✅  LEGITIMATE TRANSACTION"
+    story.append(Paragraph(verdict_label, s_verdict))
+    conf_pct = prob_val * 100 if verdict == "FRAUD" else (1 - prob_val) * 100
+    conf_label = "fraud probability" if verdict == "FRAUD" else "legitimate probability"
+    story.append(Paragraph(f"Confidence: {conf_pct:.1f}% {conf_label}", s_conf))
+
+    # Risk score bar (text-based)
+    bar_filled = int(prob_val * 30)
+    bar = "█" * bar_filled + "░" * (30 - bar_filled)
+    risk_style = sty("risk", fontSize=8, textColor=verdict_color, fontName="Courier",
+                     alignment=TA_CENTER, spaceAfter=4)
+    story.append(Paragraph(f"RISK SCORE: {bar} {prob_val*100:.1f}%", risk_style))
+    story.append(HRFlowable(width="100%", thickness=1, color=BORDER, spaceAfter=10))
+
+    # ── Transaction Details table
+    story.append(Paragraph("TRANSACTION DETAILS", s_section))
+
+    fields = [
+        ("Amount",              f"${amount:,.2f}"),
+        ("Transaction Hour",    f"{hour:02d}:00"),
+        ("Merchant Category",   merchant),
+        ("Foreign Transaction", "YES" if foreign else "NO"),
+        ("Location Mismatch",   "YES — Mismatch detected" if location else "NO — Location OK"),
+        ("Device Trust Score",  f"{device} / 100"),
+        ("Velocity (24h)",      f"{velocity} transactions"),
+        ("Cardholder Age",      f"{age} years"),
+    ]
+
+    tdata = [[Paragraph(k, s_label), Paragraph(v, s_value)] for k, v in fields]
+    t = Table(tdata, colWidths=[70*mm, 100*mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, -1), CARD_BG),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [CARD_BG, colors.HexColor("#0d1117")]),
+        ("TEXTCOLOR",   (0, 0), (-1, -1), TEXT_MAIN),
+        ("GRID",        (0, 0), (-1, -1), 0.5, BORDER),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING",(0, 0), (-1, -1), 10),
+        ("TOPPADDING",  (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING",(0,0), (-1, -1), 7),
+        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(t)
+
+    # ── Model Info table
+    story.append(Paragraph("MODEL INFORMATION", s_section))
+    mdata = [
+        [Paragraph("Algorithm", s_label),   Paragraph("Random Forest Classifier", s_value)],
+        [Paragraph("Decision Threshold", s_label), Paragraph("0.50  (50%)", s_value)],
+        [Paragraph("Features Used", s_label), Paragraph("8 transaction features", s_value)],
+        [Paragraph("Training Set", s_label), Paragraph("8,000 transactions", s_value)],
+    ]
+    mt = Table(mdata, colWidths=[70*mm, 100*mm])
+    mt.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, -1), CARD_BG),
+        ("ROWBACKGROUNDS",(0,0),(-1,-1),[CARD_BG, colors.HexColor("#0d1117")]),
+        ("GRID",        (0, 0), (-1, -1), 0.5, BORDER),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING",(0, 0), (-1, -1), 10),
+        ("TOPPADDING",  (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING",(0,0), (-1, -1), 7),
+        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(mt)
+
+    # ── Disclaimer
+    story.append(Spacer(1, 16))
+    story.append(HRFlowable(width="100%", thickness=1, color=BORDER, spaceAfter=8))
+    story.append(Paragraph(
+        "⚠  FOR DEMONSTRATION PURPOSES ONLY — NOT FOR PRODUCTION FINANCIAL USE",
+        s_footer
+    ))
+    story.append(Paragraph(
+        f"Generated by FraudGuard AI  ·  Detection Engine v2.4  ·  {ts}",
+        s_footer
+    ))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+# ─── Chart helpers ────────────────────────────────────────────────────────────
 def gauge_chart(prob, is_fraud):
     color = "#ef4444" if is_fraud else "#22c55e"
     fig = go.Figure(go.Indicator(
@@ -217,9 +480,7 @@ def gauge_chart(prob, is_fraud):
         gauge={
             "axis": {"range": [0, 100], "tickfont": {"color": "#64748b", "size": 11, "family": "Space Mono"}, "ticksuffix": "%", "nticks": 6},
             "bar": {"color": color, "thickness": 0.3},
-            "bgcolor": "#111827",
-            "bordercolor": "#1e2533",
-            "borderwidth": 1,
+            "bgcolor": "#111827", "bordercolor": "#1e2533", "borderwidth": 1,
             "steps": [
                 {"range": [0, 30],   "color": "rgba(34,197,94,0.12)"},
                 {"range": [30, 60],  "color": "rgba(251,191,36,0.10)"},
@@ -312,26 +573,41 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
+    # ── Improved Model Performance with tooltips
     st.markdown("<div class='section-label'>Model Performance</div>", unsafe_allow_html=True)
-    for stat, val in MODEL_STATS.items():
+    for stat, (val, tooltip) in MODEL_STATS.items():
         bar_w = int(val * 100)
         color = "#22c55e" if val >= 0.75 else "#f59e0b" if val >= 0.5 else "#ef4444"
         st.markdown(f"""
-        <div style='margin-bottom:0.9rem;'>
-            <div style='display:flex;justify-content:space-between;margin-bottom:4px;'>
+        <div style='margin-bottom:1rem;'>
+            <div style='display:flex;justify-content:space-between;margin-bottom:2px;'>
                 <span style='font-family:Space Mono;font-size:0.72rem;color:#64748b;
                              letter-spacing:0.08em;'>{stat}</span>
                 <span style='font-family:Space Mono;font-size:0.82rem;font-weight:700;
                              color:{color};'>{val:.2f}</span>
             </div>
-            <div style='background:#1e2533;border-radius:4px;height:4px;'>
+            <div style='background:#1e2533;border-radius:4px;height:4px;margin-bottom:3px;'>
                 <div style='background:{color};width:{bar_w}%;height:4px;
                             border-radius:4px;transition:width 0.6s ease;'></div>
             </div>
+            <div style='font-size:0.62rem;color:#374151;font-style:italic;
+                        line-height:1.4;font-family:DM Sans,sans-serif;'>{tooltip}</div>
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    # ── What the metrics mean callout
+    st.markdown("""
+    <div style='background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.15);
+                border-radius:8px;padding:0.7rem 0.9rem;margin-bottom:1.2rem;'>
+        <div style='font-family:Space Mono;font-size:0.62rem;color:#ef4444;
+                    letter-spacing:0.1em;margin-bottom:0.4rem;'>NOTE ON RECALL = 0.60</div>
+        <div style='font-size:0.65rem;color:#64748b;line-height:1.5;'>
+            The model catches 60% of real fraud cases. Raising the threshold lowers false alarms
+            but misses more fraud. Lower it to catch more at the cost of more false positives.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
     st.markdown("<div class='section-label'>Model Details</div>", unsafe_allow_html=True)
     for k, v in {"Algorithm": "Random Forest", "Trees": "100", "Max Depth": "10",
                  "Features": "8", "Threshold": "0.50", "Training": "8,000 txns"}.items():
@@ -401,9 +677,11 @@ with tab_single:
             with st.spinner("Running inference..."):
                 X = preprocess_single(amount, hour, merchant, foreign,
                                       location, device, velocity, age)
-                prob, label = predict(X)
+                prob, pred_label = predict(X)
                 prob_val = float(prob[0])
-                is_fraud = bool(label[0])
+                is_fraud = bool(pred_label[0])
+
+            verdict = "FRAUD" if is_fraud else "LEGITIMATE"
 
             if is_fraud:
                 st.markdown(f"""
@@ -421,6 +699,22 @@ with tab_single:
             st.markdown("<br>", unsafe_allow_html=True)
             st.plotly_chart(gauge_chart(prob_val, is_fraud),
                             use_container_width=True, config={"displayModeBar": False})
+
+            # ── PDF Export button
+            st.markdown("<div class='section-label' style='margin-top:0.5rem;'>Export</div>",
+                        unsafe_allow_html=True)
+            pdf_bytes = generate_pdf_report(
+                verdict, prob_val, amount, hour, merchant,
+                foreign, location, device, velocity, age
+            )
+            ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                label="📄  Download PDF Report",
+                data=pdf_bytes,
+                file_name=f"fraudguard_report_{ts_str}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
 
             st.markdown("<div class='section-label' style='margin-top:1rem;'>Input Summary</div>",
                         unsafe_allow_html=True)
@@ -469,6 +763,12 @@ with tab_batch:
                 amount · transaction_hour · merchant_category · foreign_transaction ·
                 location_mismatch · device_trust_score · velocity_last_24h · cardholder_age
             </div>
+            <div style='font-size:0.68rem;color:#374151;margin-top:0.6rem;line-height:1.6;'>
+                ✦ Column names are auto-normalised — common aliases like <code>amt</code>,
+                <code>age</code>, <code>hour</code>, <code>merchant</code> are accepted.<br>
+                ✦ Extra columns (e.g. transaction_id) are ignored automatically.<br>
+                ✦ merchant_category accepts partial text: "electronics", "grocery", "travel", etc.
+            </div>
         </div>""", unsafe_allow_html=True)
 
     with col_dl:
@@ -489,25 +789,33 @@ with tab_batch:
 
     st.markdown("<br>", unsafe_allow_html=True)
     uploaded = st.file_uploader("Upload transaction CSV for batch analysis", type=["csv"],
-                                help="Upload a CSV with the required columns listed above")
+                                help="Column names are auto-detected. Extra columns are ignored.")
 
     if uploaded:
         try:
             df_raw = pd.read_csv(uploaded)
+
+            # ── Run flexible preprocessing
+            with st.spinner(f"Preprocessing and analyzing {len(df_raw):,} transactions..."):
+                X_batch, proc_warnings, clean_df = preprocess_batch(df_raw)
+                probs, labels = predict(X_batch)
+
+            # ── Show preprocessing warnings (non-fatal)
+            if proc_warnings:
+                warn_html = "<br>".join(f"· {w}" for w in proc_warnings)
+                st.markdown(f"""
+                <div class='warning-box'>
+                    <strong>PREPROCESSING NOTES</strong><br>{warn_html}
+                </div>""", unsafe_allow_html=True)
+
             st.markdown(f"""
             <div style='font-family:Space Mono;font-size:0.75rem;color:#475569;
                         margin:0.5rem 0 1rem;'>
-                ✓ Loaded {len(df_raw):,} transactions · {df_raw.shape[1]} columns detected
+                ✓ Processed {len(X_batch):,} transactions · {df_raw.shape[1]} columns detected
             </div>""", unsafe_allow_html=True)
 
-            with st.spinner(f"Analyzing {len(df_raw):,} transactions..."):
-                X_batch       = preprocess_batch(df_raw)
-                probs, labels = predict(X_batch)
-
-            df_results = df_raw.copy()
-            for col in ["transaction_id", "is_fraud"]:
-                if col in df_results.columns:
-                    df_results = df_results.drop(columns=[col])
+            # Build results df from clean_df (original values, not encoded)
+            df_results = clean_df.copy()
             df_results.insert(0, "Fraud Probability", [f"{p*100:.1f}%" for p in probs])
             df_results.insert(0, "Prediction", ["FRAUD" if l else "LEGITIMATE" for l in labels])
             df_results.insert(0, "Txn #", range(1, len(df_results)+1))
@@ -521,10 +829,10 @@ with tab_batch:
             st.markdown("<div class='section-label'>Batch Summary</div>", unsafe_allow_html=True)
             m1, m2, m3, m4 = st.columns(4)
             for col, label_txt, val, delta_txt, delta_color in [
-                (m1, "TOTAL TRANSACTIONS", f"{n_total:,}",  "batch complete",                    "#64748b"),
+                (m1, "TOTAL TRANSACTIONS", f"{n_total:,}",  "batch complete",                       "#64748b"),
                 (m2, "FRAUDULENT",         f"{n_fraud:,}",  f"{n_fraud/n_total*100:.1f}% of batch", "#ef4444"),
                 (m3, "LEGITIMATE",         f"{n_legit:,}",  f"{n_legit/n_total*100:.1f}% of batch", "#22c55e"),
-                (m4, "AVG RISK SCORE",     f"{avg_risk:.1f}%", f"max: {max_risk:.1f}%",          "#f97316"),
+                (m4, "AVG RISK SCORE",     f"{avg_risk:.1f}%", f"max: {max_risk:.1f}%",             "#f97316"),
             ]:
                 col.markdown(f"""
                 <div class='metric-card'>
@@ -598,12 +906,23 @@ with tab_batch:
                 Showing {len(df_display):,} of {n_total:,} transactions
             </div>""", unsafe_allow_html=True)
 
-        except Exception as e:
-            st.error(f"Error processing file: {str(e)}")
+        except ValueError as e:
+            st.error(f"⚠️ Could not process file: {str(e)}")
             st.markdown("""
-            <div style='font-family:Space Mono;font-size:0.78rem;color:#64748b;margin-top:0.5rem;'>
-                Ensure your CSV contains all required columns with correct names and types.<br>
-                merchant_category must be one of: Clothing, Electronics, Food, Grocery, Travel
+            <div class='warning-box'>
+                <strong>HOW TO FIX</strong><br>
+                · Ensure all 8 required columns are present (aliases like <code>amt</code>,
+                  <code>age</code>, <code>hour</code> are accepted)<br>
+                · merchant_category must be one of: Clothing, Electronics, Food, Grocery, Travel<br>
+                · Binary columns (foreign_transaction, location_mismatch) must be 0 or 1<br>
+                · Download the template CSV above for the correct format
+            </div>""", unsafe_allow_html=True)
+
+        except Exception as e:
+            st.error(f"Unexpected error: {str(e)}")
+            st.markdown("""
+            <div class='warning-box'>
+                An unexpected error occurred. Check the file is a valid CSV and try again.
             </div>""", unsafe_allow_html=True)
     else:
         st.markdown("""
